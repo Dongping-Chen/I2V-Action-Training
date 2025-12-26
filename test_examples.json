@@ -1,0 +1,52 @@
+[
+  {
+    "input_image": "/fs/cml-projects/worldmodel/Self-Forcing/dataset_download/Sekai-Project/sekai-game-drone_v2_processed/first_frames/00100310001_0007350_0007650_clip1.jpg",
+    "prompt": "The drone ascends and moves forward over the dark, rugged coastline of Castle Rock Beach at dusk, revealing a silhouetted treeline against the fading light of the horizon. The camera tilts upward, capturing the smooth, calm water lapping against the rocks below and the soft gradient of deep orange and muted purple in the sky.",
+    "video": "/fs/cml-projects/worldmodel/Self-Forcing/dataset_download/Sekai-Project/sekai-game-drone_v2_processed/00100310001_0007350_0007650_clip1.mp4"
+  },
+  {
+    "input_image": "/fs/cml-projects/worldmodel/Self-Forcing/dataset_download/Sekai-Project/sekai-game-drone_v2_processed/first_frames/00300210001_0002250_0002550_clip0.jpg",
+    "prompt": "The camera smoothly glides forward along a stone staircase, moving through a dense tunnel of vibrant red torii gates at Fushimi Inari Taisha. Sunlight filters through the thick forest canopy, casting dappled light and long shadows across the path and the weathered wooden pillars.",
+    "video": "/fs/cml-projects/worldmodel/Self-Forcing/dataset_download/Sekai-Project/sekai-game-drone_v2_processed/00300210001_0002250_0002550_clip0.mp4"
+  },
+  {
+    "input_image": "/fs/cml-projects/worldmodel/Self-Forcing/dataset_download/Sekai-Project/sekai-game-drone_v2_processed/first_frames/00900310001_0006907_0007207_clip1.jpg",
+    "prompt": "The camera moves forward along a dark, narrow stone staircase winding through a dense forest at night, flanked by massive tree trunks and large boulders. The scene is shrouded in deep shadow, with only faint ambient light revealing the rough textures of the rocks and the path ahead.",
+    "video": "/fs/cml-projects/worldmodel/Self-Forcing/dataset_download/Sekai-Project/sekai-game-drone_v2_processed/00900310001_0006907_0007207_clip1.mp4"
+  },
+  {
+    "input_image": "/fs/cml-projects/worldmodel/Self-Forcing/dataset_download/Sekai-Project/sekai-game-drone_v2_processed/first_frames/00300210001_0002250_0002550_clip1.jpg",
+    "prompt": "The camera moves steadily forward along a moss-covered stone staircase, passing through a series of vibrant red torii gates that line the path into a dense, sun-dappled forest. The bright sunlight filters through the lush green canopy above, casting dynamic shadows on the steps.",
+    "video": "/fs/cml-projects/worldmodel/Self-Forcing/dataset_download/Sekai-Project/sekai-game-drone_v2_processed/00300210001_0002250_0002550_clip1.mp4"
+  },
+  {
+    "input_image": "/fs/cml-projects/worldmodel/Self-Forcing/dataset_download/Sekai-Project/sekai-game-drone_v2_processed/first_frames/00100310001_0007350_0007650_clip0.jpg",
+    "prompt": "The camera glides forward over the calm waters of Castle Rock Beach at sunset, capturing the serene expanse as the sky transitions from deep orange near the horizon to muted purples above, with soft clouds reflecting on the water's surface.",
+    "video": "/fs/cml-projects/worldmodel/Self-Forcing/dataset_download/Sekai-Project/sekai-game-drone_v2_processed/00100310001_0007350_0007650_clip0.mp4"
+  },
+  {
+    "input_image": "/fs/cml-projects/worldmodel/Self-Forcing/dataset_download/Sekai-Project/sekai-game-drone_v2_processed/first_frames/00900310001_0006907_0007207_clip0.jpg",
+    "prompt": "The camera glides forward along a narrow, dimly lit stone path through a dense forest at night, with towering trees and a rocky cliff face lining the way. The scene is shrouded in deep darkness, illuminated only by faint ambient light.",
+    "video": "/fs/cml-projects/worldmodel/Self-Forcing/dataset_download/Sekai-Project/sekai-game-drone_v2_processed/00900310001_0006907_0007207_clip0.mp4"
+  },
+  {
+    "input_image": "/fs/cml-projects/worldmodel/Self-Forcing/dataset_download/Sekai-Project/sekai-game-drone_v2_processed/first_frames/00100310001_0007350_0007650_clip2.jpg",
+    "prompt": "The drone glides forward over a dense, dark treeline at dusk, its silhouette stark against the fading light of the horizon. The camera maintains a steady, smooth motion, moving horizontally across the landscape as the sky transitions from deep orange to muted purple.",
+    "video": "/fs/cml-projects/worldmodel/Self-Forcing/dataset_download/Sekai-Project/sekai-game-drone_v2_processed/00100310001_0007350_0007650_clip2.mp4"
+  },
+  {
+    "input_image": "/fs/cml-projects/worldmodel/Self-Forcing/dataset_download/Sekai-Project/sekai-game-drone_v2_processed/first_frames/00900310001_0006907_0007207_clip2.jpg",
+    "prompt": "The camera moves forward along a narrow, dimly lit stone path at night, flanked by towering trees and a massive rock formation on the left, creating a deep, enclosed canyon-like passage. The scene is shrouded in darkness.",
+    "video": "/fs/cml-projects/worldmodel/Self-Forcing/dataset_download/Sekai-Project/sekai-game-drone_v2_processed/00900310001_0006907_0007207_clip2.mp4"
+  },
+  {
+    "input_image": "/fs/cml-projects/worldmodel/Self-Forcing/dataset_download/Sekai-Project/sekai-game-drone_v2_processed/first_frames/00700110001_0016350_0016650_clip0.jpg",
+    "prompt": "The camera moves steadily forward along a narrow, overgrown stone path flanked by a building covered in dense ivy on the left and shadowy trees on the right, all under a dimly lit, cloudy sky that casts a soft, diffused light over the scene.",
+    "video": "/fs/cml-projects/worldmodel/Self-Forcing/dataset_download/Sekai-Project/sekai-game-drone_v2_processed/00700110001_0016350_0016650_clip0.mp4"
+  },
+  {
+    "input_image": "/fs/cml-projects/worldmodel/Self-Forcing/dataset_download/Sekai-Project/sekai-game-drone_v2_processed/first_frames/00300210001_0002250_0002550_clip2.jpg",
+    "prompt": "The camera moves forward and slightly downward, gliding through a dense forest path lined with vibrant red torii gates at Fushimi Inari Taisha. Sunlight filters through the thick canopy, casting dappled light and long shadows across the stone and dirt path.",
+    "video": "/fs/cml-projects/worldmodel/Self-Forcing/dataset_download/Sekai-Project/sekai-game-drone_v2_processed/00300210001_0002250_0002550_clip2.mp4"
+  }
+]
