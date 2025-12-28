@@ -43,6 +43,7 @@ class WanActionTrainingModule(DiffusionTrainingModule):
         action_injection_type=None,
         action_initial_scale=None,
         action_controller_checkpoint=None,
+        action_cross_attn_train_mode=None,
     ):
         super().__init__()
 
@@ -81,12 +82,37 @@ class WanActionTrainingModule(DiffusionTrainingModule):
             ac_config["initial_scale"] = action_initial_scale
         if "action_text_dim" not in ac_config and getattr(self.pipe, "text_encoder", None) is not None:
             ac_config["action_text_dim"] = self.pipe.text_encoder.dim
+        if "num_heads" not in ac_config and getattr(self.pipe, "dit", None) is not None:
+            try:
+                ac_config["num_heads"] = self.pipe.dit.blocks[0].cross_attn.num_heads
+            except Exception:
+                pass
+
+        injection_type = ac_config.get("injection_type")
+        resolved_cross_attn_train_mode = action_cross_attn_train_mode
+        if injection_type == "cross_attn":
+            if resolved_cross_attn_train_mode is None:
+                resolved_cross_attn_train_mode = "lora" if lora_base_model == "action_controller" else "full"
+            if resolved_cross_attn_train_mode == "full":
+                if lora_base_model not in (None, "") or lora_checkpoint is not None:
+                    print("[warn] action_cross_attn_train_mode=full: ignoring `--lora_*` arguments.")
+                lora_base_model = None
+                lora_checkpoint = None
+            elif resolved_cross_attn_train_mode == "lora":
+                if lora_base_model in (None, ""):
+                    lora_base_model = "action_controller"
+        else:
+            resolved_cross_attn_train_mode = None
+            if action_cross_attn_train_mode is not None:
+                print("[warn] `--action_cross_attn_train_mode` is only used when action_injection_type=cross_attn; ignoring.")
 
         self.pipe.action_controller = WanActionController(**ac_config)
         self.pipe.action_controller = self.pipe.action_controller.to(
             device=device,
             dtype=torch.bfloat16
         )
+        if getattr(self.pipe.action_controller, "injection_type", None) == "cross_attn":
+            self.pipe.action_controller.init_from_dit(getattr(self.pipe, "dit", None))
 
         if action_controller_checkpoint is not None:
             if action_controller_checkpoint.endswith(".safetensors"):
@@ -101,6 +127,23 @@ class WanActionTrainingModule(DiffusionTrainingModule):
             lora_base_model, lora_target_modules, lora_rank, lora_checkpoint,
             task=task,
         )
+        self.action_cross_attn_train_mode = resolved_cross_attn_train_mode
+        if lora_base_model == "action_controller" and lora_checkpoint is not None:
+            try:
+                if lora_checkpoint.endswith(".safetensors"):
+                    lora_state = load_safetensors(lora_checkpoint)
+                else:
+                    lora_state = torch.load(lora_checkpoint, map_location="cpu")
+                gate_state = {
+                    k: v
+                    for k, v in lora_state.items()
+                    if k in ("action_gate", "action_patch_gate")
+                }
+                if gate_state:
+                    self.pipe.action_controller.load_state_dict(gate_state, strict=False)
+                    print(f"Loaded action gate(s) from LoRA checkpoint: {lora_checkpoint}")
+            except Exception as e:
+                print(f"Warning: failed to load action gate(s) from LoRA checkpoint: {e}")
 
         self.lora_base_model = lora_base_model
         trainable_model_names = set(trainable_models.split(",")) if trainable_models else set()
@@ -119,13 +162,34 @@ class WanActionTrainingModule(DiffusionTrainingModule):
                         param.requires_grad = False
                 print(f"LoRA trainable params ({lora_base_model}): {lora_params}")
 
-        if trainable_models is not None and "action_controller" in trainable_models.split(","):
+        action_controller_trainable = (
+            trainable_models is not None and "action_controller" in trainable_models.split(",")
+        )
+        if action_controller_trainable:
             self.pipe.action_controller.train()
             self.pipe.action_controller.requires_grad_(True)
             print(f"Action controller trainable params: {sum(p.numel() for p in self.pipe.action_controller.parameters() if p.requires_grad)}")
         else:
             self.pipe.action_controller.eval()
             self.pipe.action_controller.requires_grad_(False)
+
+        if getattr(self.pipe.action_controller, "injection_type", None) == "cross_attn" and not task.endswith(":data_process"):
+            mode = self.action_cross_attn_train_mode or ("lora" if self.lora_base_model == "action_controller" else "full")
+            self.pipe.action_controller.train()
+            frozen = 0
+            trainable = 0
+            for name, param in self.pipe.action_controller.named_parameters():
+                allow = False
+                if mode == "lora":
+                    allow = ("lora_" in name)
+                elif mode == "full":
+                    allow = name.startswith("action_cross_attn.")
+                param.requires_grad = bool(allow)
+                if allow:
+                    trainable += param.numel()
+                else:
+                    frozen += param.numel()
+            print(f"Action controller (cross_attn, mode={mode}) trainable params: {trainable} (frozen: {frozen})")
 
         self.action_magnitude_scale = ACTION_MAGNITUDE_SCALE
         self.use_gradient_checkpointing = use_gradient_checkpointing
@@ -210,6 +274,12 @@ class WanActionTrainingModule(DiffusionTrainingModule):
         if self.lora_base_model not in (None, ""):
             prefix = f"pipe.{self.lora_base_model}."
             state_dict = {k: v for k, v in state_dict.items() if not (k.startswith(prefix) and "lora_" in k)}
+            if self.lora_base_model == "action_controller":
+                state_dict = {
+                    k: v
+                    for k, v in state_dict.items()
+                    if not (k.startswith(prefix) and k.split(".")[-1] in ("action_gate", "action_patch_gate"))
+                }
 
         if remove_prefix is not None:
             state_dict_ = {}
@@ -232,9 +302,16 @@ def action_parser():
     parser.add_argument("--action_controller_config", type=str, default="wan_ti2v_5b",
                         choices=list(ACTION_CONTROLLER_CONFIGS.keys()))
     parser.add_argument("--action_injection_type", type=str, default=None,
-                        choices=["patch_add", "layer_add"])
+                        choices=["patch_add", "layer_add", "cross_attn"])
     parser.add_argument("--action_initial_scale", type=float, default=None)
     parser.add_argument("--action_controller_checkpoint", type=str, default=None)
+    parser.add_argument(
+        "--action_cross_attn_train_mode",
+        type=str,
+        default=None,
+        choices=["lora", "full"],
+        help="Training mode when action_injection_type=cross_attn: train LoRA adapters or full copied cross-attn.",
+    )
     parser.add_argument("--max_timestep_boundary", type=float, default=1.0)
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0)
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true")
@@ -250,6 +327,34 @@ if __name__ == "__main__":
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=True)],
     )
+
+    if accelerator.is_main_process:
+        base_cfg = ACTION_CONTROLLER_CONFIGS.get(args.action_controller_config, {})
+        injection_type = args.action_injection_type or base_cfg.get("injection_type")
+        if injection_type == "cross_attn" and args.lora_base_model not in ("action_controller",):
+            print(
+                "[warn] action_injection_type=cross_attn is intended for LoRA training on "
+                "`--lora_base_model action_controller`."
+            )
+        if (
+            injection_type == "cross_attn"
+            and args.action_controller_checkpoint is not None
+            and args.lora_base_model == "action_controller"
+        ):
+            print(
+                "[warn] cross_attn + LoRA training: `--action_controller_checkpoint` is usually not needed. "
+                "Prefer `--lora_checkpoint` to resume LoRA weights/gates."
+            )
+        if (
+            injection_type == "cross_attn"
+            and args.resume_from
+            and args.lora_base_model == "action_controller"
+            and not args.lora_checkpoint
+        ):
+            print(
+                "[warn] `--resume_from` does not automatically restore LoRA weights/gates saved as "
+                "`lora.safetensors`. Pass `--lora_checkpoint <resume_dir>/lora.safetensors` if needed."
+            )
 
     dataset = UnifiedDataset(
         base_path=args.dataset_base_path,
@@ -292,6 +397,7 @@ if __name__ == "__main__":
         action_injection_type=args.action_injection_type,
         action_initial_scale=args.action_initial_scale,
         action_controller_checkpoint=args.action_controller_checkpoint,
+        action_cross_attn_train_mode=args.action_cross_attn_train_mode,
     )
 
     action_cfg = ACTION_CONTROLLER_CONFIGS[args.action_controller_config].copy()
@@ -301,11 +407,17 @@ if __name__ == "__main__":
         action_cfg["initial_scale"] = args.action_initial_scale
     if "action_text_dim" not in action_cfg and getattr(model.pipe, "text_encoder", None) is not None:
         action_cfg["action_text_dim"] = model.pipe.text_encoder.dim
+    if "num_heads" not in action_cfg and getattr(model.pipe, "dit", None) is not None:
+        try:
+            action_cfg["num_heads"] = model.pipe.dit.blocks[0].cross_attn.num_heads
+        except Exception:
+            pass
     base_model_id = "Wan-AI/Wan2.2-TI2V-5B" if args.model_dir is None else None
     save_config = {
         "base_model_id": base_model_id,
         "base_model_dir": args.model_dir,
         "action_controller_config": action_cfg,
+        "action_cross_attn_train_mode": args.action_cross_attn_train_mode,
         "action_magnitude_scale": ACTION_MAGNITUDE_SCALE.tolist(),
         "lora": {
             "lora_base_model": args.lora_base_model,
@@ -327,6 +439,13 @@ if __name__ == "__main__":
             for k, v in state_dict.items()
             if k.startswith(prefix) and "lora_" in k
         }
+        if base_name == "action_controller":
+            for k, v in state_dict.items():
+                if not k.startswith(prefix):
+                    continue
+                rel = k[len(prefix):]
+                if rel in ("action_gate", "action_patch_gate"):
+                    lora_state[rel] = v
         if not lora_state:
             return
         path = os.path.join(checkpoint_dir, "lora.safetensors")
@@ -351,7 +470,9 @@ if __name__ == "__main__":
         checkpoint_weights_name="action_controller.safetensors",
     )
     os.makedirs(args.output_path, exist_ok=True)
-    with open(os.path.join(args.output_path, "action_train_config.json"), "w") as f:
-        json.dump(save_config, f, indent=2)
+    if accelerator.is_main_process:
+        with open(os.path.join(args.output_path, "action_train_config.json"), "w") as f:
+            json.dump(save_config, f, indent=2)
+    accelerator.wait_for_everyone()
 
     launch_training_task(accelerator, dataset, model, model_logger, args=args)

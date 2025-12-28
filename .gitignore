@@ -6,6 +6,7 @@
 /inference_action
 /inference_results
 /wandb
+*.out
 *.pkl
 *.safetensors
 *.pth

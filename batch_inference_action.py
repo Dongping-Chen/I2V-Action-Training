@@ -110,14 +110,10 @@ def expected_action_length(num_frames, time_division_factor, time_division_remai
 def align_action_length(action_magnitude, target_len):
     if target_len is None:
         return action_magnitude
-    current_len = action_magnitude.shape[1]
-    if current_len == target_len:
-        return action_magnitude
-    if current_len > target_len:
-        return action_magnitude[:, :target_len]
-    pad = target_len - current_len
-    pad_shape = (action_magnitude.shape[0], pad, action_magnitude.shape[2])
-    action_magnitude = torch.cat([action_magnitude, torch.zeros(pad_shape, dtype=action_magnitude.dtype)], dim=1)
+    current_len = int(action_magnitude.shape[1])
+    target_len = int(target_len)
+    if current_len != target_len:
+        raise ValueError(f"Action length mismatch: expected {target_len}, got {current_len}.")
     return action_magnitude
 
 
@@ -534,12 +530,47 @@ def main():
         args.action_controller_path,
         args.action_config_path,
     )
-    if action_controller_path is None:
-        raise ValueError("Missing action controller weights. Set --action_dir or --action_controller_path.")
+    config_snapshot = {}
+    if action_config_path:
+        try:
+            with open(action_config_path, "r", encoding="utf-8") as f:
+                config_snapshot = json.load(f)
+        except Exception:
+            config_snapshot = {}
+    cfg_action = config_snapshot.get("action_controller_config")
+    if isinstance(cfg_action, str):
+        injection_type = ACTION_CONTROLLER_CONFIGS.get(cfg_action, {}).get("injection_type")
+    elif isinstance(cfg_action, dict):
+        injection_type = cfg_action.get("injection_type")
+    else:
+        injection_type = None
+    if args.action_injection_type is not None:
+        injection_type = args.action_injection_type
+
+    cross_attn_train_mode = config_snapshot.get("action_cross_attn_train_mode")
+    if injection_type == "cross_attn":
+        if cross_attn_train_mode not in ("lora", "full"):
+            lora_cfg = config_snapshot.get("lora", {}) if isinstance(config_snapshot, dict) else {}
+            lora_base = lora_cfg.get("lora_base_model")
+            cross_attn_train_mode = "lora" if lora_base == "action_controller" else "full"
+
+    if injection_type == "cross_attn":
+        if action_config_path is None:
+            raise ValueError("Missing action_train_config.json for cross_attn action controller. Set --action_dir or --action_config_path.")
+        if cross_attn_train_mode == "full" and action_controller_path is None:
+            raise ValueError("Missing action controller weights for cross_attn(full) mode. Set --action_dir or --action_controller_path.")
+    else:
+        if action_controller_path is None:
+            raise ValueError("Missing action controller weights. Set --action_dir or --action_controller_path.")
+
+    action_ckpt_path_for_load = action_controller_path
+    if injection_type == "cross_attn":
+        # Always init_from_dit before loading any trained cross-attn weights to avoid overwriting.
+        action_ckpt_path_for_load = None
 
     action_controller, action_scale = load_action_controller(
         action_config_path,
-        action_controller_path,
+        action_ckpt_path_for_load,
         device=args.device,
         torch_dtype=torch_dtype,
         overrides={
@@ -548,12 +579,46 @@ def main():
         },
     )
     pipe.action_controller = action_controller
-    if lora_path:
-        if getattr(pipe, "dit", None) is None:
-            print("LoRA checkpoint found but pipe.dit is missing; skipping LoRA load.")
+    if getattr(pipe.action_controller, "injection_type", None) == "cross_attn":
+        if cross_attn_train_mode == "lora":
+            if action_controller_path:
+                print(
+                    "[warn] cross_attn(lora) action controller is initialized by copying the base DiT cross-attention. "
+                    "`--action_controller_path` is usually unnecessary."
+                )
+            if not lora_path:
+                print(
+                    "[warn] cross_attn(lora) action controller: no `lora.safetensors` found. "
+                    "If you trained LoRA-only, make sure to pass `--action_dir` (or `--action_config_path` + `--action_controller_path`) "
+                    "so `lora.safetensors` can be resolved and loaded."
+                )
+        elif cross_attn_train_mode == "full":
+            if lora_path:
+                print(
+                    "[warn] cross_attn(full) action controller: `lora.safetensors` is present but will be ignored "
+                    "(full weights will be loaded from action_controller checkpoint)."
+                )
+    if getattr(pipe.action_controller, "injection_type", None) == "cross_attn" and getattr(pipe, "dit", None) is not None:
+        pipe.action_controller.init_from_dit(pipe.dit)
+        if cross_attn_train_mode == "full" and action_controller_path:
+            if str(action_controller_path).endswith(".safetensors"):
+                from safetensors.torch import load_file as load_safetensors
+                state_dict = load_safetensors(action_controller_path)
+            else:
+                state_dict = torch.load(action_controller_path, map_location="cpu")
+            pipe.action_controller.load_state_dict(state_dict, strict=False)
+            print(f"Loaded action controller weights (cross_attn full): {action_controller_path}")
+    if lora_path and not (injection_type == "cross_attn" and cross_attn_train_mode == "full"):
+        lora_cfg = config_snapshot.get("lora", {}) if isinstance(config_snapshot, dict) else {}
+        lora_base = lora_cfg.get("lora_base_model")
+        if not lora_base and getattr(pipe.action_controller, "injection_type", None) == "cross_attn":
+            lora_base = "action_controller"
+        target = getattr(pipe, lora_base, None) if lora_base else getattr(pipe, "dit", None)
+        if target is None:
+            print("LoRA checkpoint found but target module is missing; skipping LoRA load.")
         else:
-            pipe.load_lora(pipe.dit, lora_path)
-            print(f"Loaded LoRA: {lora_path}")
+            pipe.load_lora(target, lora_path)
+            print(f"Loaded LoRA: {lora_path} (base={lora_base or 'dit'})")
 
     image_processor = ImageCropAndResize(
         height=args.height,

@@ -301,10 +301,10 @@ class WanVideoPipeline(BasePipeline):
                 self.load_models_to_device(self.in_iteration_models_2)
                 models["dit"] = self.dit2
                 models["vace"] = self.vace2
-                
+
             # Timestep
             timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
-            
+
             # Inference
             noise_pred_posi = self.model_fn(**models, **inputs_shared, **inputs_posi, timestep=timestep)
             if cfg_scale != 1.0:
@@ -421,7 +421,7 @@ class WanVideoUnit_PromptEmbedder(PipelineUnit):
         seq_lens = mask.gt(0).sum(dim=1).long()
         prompt_emb = pipe.text_encoder(ids, mask)
         for i, v in enumerate(seq_lens):
-            prompt_emb[:, v:] = 0
+            prompt_emb[i, v:] = 0
         return prompt_emb
 
     def process(self, pipe: WanVideoPipeline, prompt, positive) -> dict:
@@ -434,8 +434,8 @@ class WanVideoUnit_PromptEmbedder(PipelineUnit):
 class WanVideoUnit_ActionTextEmbedder(PipelineUnit):
     def __init__(self):
         super().__init__(
-            input_params=("action_magnitude",),
-            output_params=("action_text_embeds",),
+            input_params=("action_magnitude", "num_frames"),
+            output_params=("action_text_embeds", "action_text_mask"),
             onload_model_names=("text_encoder",)
         )
         self.translation_phrases = [
@@ -541,7 +541,13 @@ class WanVideoUnit_ActionTextEmbedder(PipelineUnit):
                 cached = cached.to(device=device, dtype=dtype)
                 pipe._action_text_table = cached
             return cached
-        ids, mask = pipe.tokenizer(self.combo_phrases, return_mask=True, add_special_tokens=True)
+        ids, mask = pipe.tokenizer(
+            self.combo_phrases,
+            return_mask=True,
+            add_special_tokens=True,
+            padding="longest",
+            truncation=True,
+        )
         ids = ids.to(device)
         mask = mask.to(device)
         with torch.no_grad():
@@ -551,23 +557,76 @@ class WanVideoUnit_ActionTextEmbedder(PipelineUnit):
         pipe._action_text_table = table
         return table
 
-    def process(self, pipe: WanVideoPipeline, action_magnitude) -> dict:
+    def _get_action_text_tokens_table(self, pipe: WanVideoPipeline, device, dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        cached_tokens = getattr(pipe, "_action_text_tokens_table", None)
+        cached_mask = getattr(pipe, "_action_text_tokens_table_mask", None)
+        if cached_tokens is not None and cached_mask is not None:
+            if cached_tokens.device != device or cached_tokens.dtype != dtype:
+                cached_tokens = cached_tokens.to(device=device, dtype=dtype)
+                pipe._action_text_tokens_table = cached_tokens
+            if cached_mask.device != device:
+                cached_mask = cached_mask.to(device=device)
+                pipe._action_text_tokens_table_mask = cached_mask
+            return cached_tokens, cached_mask
+
+        ids, mask = pipe.tokenizer(
+            self.combo_phrases,
+            return_mask=True,
+            add_special_tokens=True,
+            padding="longest",
+            truncation=True,
+        )
+        ids = ids.to(device)
+        mask = mask.to(device)
+        with torch.no_grad():
+            embeds = pipe.text_encoder(ids, mask)
+
+        mask_bool = mask.to(dtype=torch.bool)
+        embeds = embeds * mask_bool.unsqueeze(-1).to(dtype=embeds.dtype)
+        tokens_table = embeds.to(dtype=dtype).view(9, 9, embeds.shape[1], embeds.shape[2])
+        mask_table = mask_bool.view(9, 9, mask.shape[1])
+        pipe._action_text_tokens_table = tokens_table
+        pipe._action_text_tokens_table_mask = mask_table
+        return tokens_table, mask_table
+
+    def process(self, pipe: WanVideoPipeline, action_magnitude, num_frames) -> dict:
         if action_magnitude is None:
             return {}
         if pipe.action_controller is None:
             return {}
-        if getattr(pipe.action_controller, "injection_type", None) not in ("patch_add", "layer_add"):
+        injection_type = getattr(pipe.action_controller, "injection_type", None)
+        if injection_type not in ("patch_add", "layer_add", "cross_attn"):
             return {}
         pipe.load_models_to_device(self.onload_model_names)
         if not torch.is_tensor(action_magnitude):
             action_magnitude = torch.tensor(action_magnitude, dtype=torch.float32)
         action_magnitude = self._ensure_action_shape(action_magnitude)
+        expected_len = None
+        factor = getattr(pipe, "time_division_factor", None)
+        remainder = getattr(pipe, "time_division_remainder", None)
+        if num_frames is not None and factor is not None and remainder is not None and int(factor) > 0:
+            expected_len = max(0, (int(num_frames) - int(remainder)) // int(factor))
+        if expected_len is not None and int(action_magnitude.shape[1]) != int(expected_len):
+            raise ValueError(
+                f"Action length mismatch: expected {int(expected_len)} steps for num_frames={int(num_frames)} "
+                f"(factor={int(factor)}, remainder={int(remainder)}), but got {int(action_magnitude.shape[1])}."
+            )
         device = pipe.device if action_magnitude.device.type == "cpu" else action_magnitude.device
-        table = self._get_action_text_table(pipe, device=device, dtype=pipe.torch_dtype)
         action_magnitude = action_magnitude.to(device=device)
         trans_idx, rot_idx = self._action_indices(action_magnitude)
-        action_text_embeds = table[trans_idx, rot_idx]
-        return {"action_text_embeds": action_text_embeds}
+
+        if injection_type in ("patch_add", "layer_add"):
+            table = self._get_action_text_table(pipe, device=device, dtype=pipe.torch_dtype)
+            action_text_embeds = table[trans_idx, rot_idx]
+            return {"action_text_embeds": action_text_embeds, "action_text_mask": None}
+
+        tokens_table, mask_table = self._get_action_text_tokens_table(pipe, device=device, dtype=pipe.torch_dtype)
+        action_text_embeds = tokens_table[trans_idx, rot_idx]
+        action_text_mask = mask_table[trans_idx, rot_idx]
+        if action_text_mask.numel() > 0:
+            action_text_mask = action_text_mask.clone()
+            action_text_mask[..., 0] = True
+        return {"action_text_embeds": action_text_embeds, "action_text_mask": action_text_mask}
 
 
 
@@ -938,7 +997,15 @@ class WanVideoUnit_TeaCache(PipelineUnit):
 class WanVideoUnit_CfgMerger(PipelineUnit):
     def __init__(self):
         super().__init__(take_over=True)
-        self.concat_tensor_names = ["context", "clip_feature", "y", "reference_latents", "action_magnitude", "action_text_embeds"]
+        self.concat_tensor_names = [
+            "context",
+            "clip_feature",
+            "y",
+            "reference_latents",
+            "action_magnitude",
+            "action_text_embeds",
+            "action_text_mask",
+        ]
 
     def process(self, pipe: WanVideoPipeline, inputs_shared, inputs_posi, inputs_nega):
         if not inputs_shared["cfg_merge"]:
@@ -952,7 +1019,7 @@ class WanVideoUnit_CfgMerger(PipelineUnit):
             tensor_posi = inputs_posi.get(name)
             tensor_nega = inputs_nega.get(name)
             tensor_shared = inputs_shared.get(name)
-            if name == "action_magnitude":
+            if name in ("action_magnitude", "action_text_mask"):
                 tensor_posi = ensure_tensor(tensor_posi)
                 tensor_nega = ensure_tensor(tensor_nega)
                 tensor_shared = ensure_tensor(tensor_shared)
@@ -1319,6 +1386,7 @@ def model_fn_wan_video(
     action_binary: Optional[torch.Tensor] = None,
     action_magnitude: Optional[torch.Tensor] = None,
     action_text_embeds: Optional[torch.Tensor] = None,
+    action_text_mask: Optional[torch.Tensor] = None,
     **kwargs,
 ):
     if sliding_window_size is not None and sliding_window_stride is not None:
@@ -1424,6 +1492,7 @@ def model_fn_wan_video(
     
     # Patchify
     f, h, w = x.shape[2:]
+    f_base = f
     x = rearrange(x, 'b c f h w -> b (f h w) c').contiguous()
     
     # Reference image
@@ -1434,8 +1503,10 @@ def model_fn_wan_video(
         x = torch.concat([reference_latents, x], dim=1)
         f += 1
 
-    # Action embedding
+    # Action embedding / context
     action_emb = None
+    action_context = None
+    action_context_mask = None
     if action_controller is not None:
         if action_magnitude is None and action_binary is not None:
             action_magnitude = action_binary
@@ -1449,12 +1520,16 @@ def model_fn_wan_video(
             elif action_magnitude.dim() == 2:
                 action_magnitude = action_magnitude.unsqueeze(0)
             action_magnitude = action_magnitude.to(device=x.device, dtype=x.dtype)
+            expected_action_len = max(int(f_base) - 1, 0)
+            if int(action_magnitude.shape[1]) != expected_action_len:
+                raise ValueError(
+                    f"Action length mismatch: expected {expected_action_len} steps for latents with f={int(f_base)} "
+                    f"(i.e. f-1), but got {int(action_magnitude.shape[1])}."
+                )
 
-            use_text = (
-                action_text_embeds is not None
-                and action_controller.injection_type in ("patch_add", "layer_add")
-            )
-            if use_text:
+            injection_type = getattr(action_controller, "injection_type", None)
+            use_pooled_text = action_text_embeds is not None and injection_type in ("patch_add", "layer_add")
+            if use_pooled_text:
                 if not torch.is_tensor(action_text_embeds):
                     action_text_embeds = torch.tensor(action_text_embeds)
                 if action_text_embeds.dim() == 2:
@@ -1464,9 +1539,33 @@ def model_fn_wan_video(
             else:
                 action_emb = action_controller.build_action_emb(action_magnitude)
 
-            if action_controller.injection_type == "patch_add":
+            if injection_type == "patch_add":
                 x = action_controller.apply_patch_add(x, action_emb, f, h, w)
-    
+
+        if getattr(action_controller, "injection_type", None) == "cross_attn" and action_text_embeds is not None:
+            if not torch.is_tensor(action_text_embeds):
+                action_text_embeds = torch.tensor(action_text_embeds)
+            if action_text_embeds.dim() == 2:
+                action_text_embeds = action_text_embeds.unsqueeze(0).unsqueeze(2)
+            elif action_text_embeds.dim() == 3:
+                action_text_embeds = action_text_embeds.unsqueeze(2)
+            action_text_embeds = action_text_embeds.to(device=x.device, dtype=x.dtype)
+            if action_text_mask is not None:
+                if not torch.is_tensor(action_text_mask):
+                    action_text_mask = torch.tensor(action_text_mask)
+                if action_text_mask.dim() == 1:
+                    action_text_mask = action_text_mask.unsqueeze(0).unsqueeze(2)
+                elif action_text_mask.dim() == 2:
+                    action_text_mask = action_text_mask.unsqueeze(2)
+                action_text_mask = action_text_mask.to(device=x.device, dtype=torch.bool)
+
+            # Project T5 embeddings (text_dim) -> DiT dim using the model's text embedding projection.
+            b, t_step, seq_len, text_dim = action_text_embeds.shape
+            flat = action_text_embeds.reshape(b * t_step, seq_len, text_dim)
+            projected = dit.text_embedding(flat)
+            action_context = projected.reshape(b, t_step, seq_len, dit.dim)
+            action_context_mask = action_text_mask
+
     freqs = torch.cat([
         dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
         dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
@@ -1521,6 +1620,8 @@ def model_fn_wan_video(
                     *inputs,
                     action_controller=action_controller,
                     action_emb=action_emb,
+                    action_context=action_context,
+                    action_context_mask=action_context_mask,
                     block_idx=block_idx,
                     num_frames=f,
                     height=h,
@@ -1573,6 +1674,8 @@ def model_fn_wan_video(
                         freqs,
                         action_controller=action_controller,
                         action_emb=action_emb,
+                        action_context=action_context,
+                        action_context_mask=action_context_mask,
                         block_idx=block_id,
                         num_frames=f,
                         height=h,

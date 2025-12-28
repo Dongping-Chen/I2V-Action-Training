@@ -238,14 +238,30 @@ class BasePipeline(torch.nn.Module):
     ):
         if state_dict is None:
             if isinstance(lora_config, str):
-                lora = load_state_dict(lora_config, torch_dtype=self.torch_dtype, device=self.device)
+                lora_state_dict = load_state_dict(lora_config, torch_dtype=self.torch_dtype, device=self.device)
             else:
                 lora_config.download_if_necessary()
-                lora = load_state_dict(lora_config.path, torch_dtype=self.torch_dtype, device=self.device)
+                lora_state_dict = load_state_dict(lora_config.path, torch_dtype=self.torch_dtype, device=self.device)
         else:
-            lora = state_dict
+            lora_state_dict = state_dict
         lora_loader = self.lora_loader(torch_dtype=self.torch_dtype, device=self.device)
-        lora = lora_loader.convert_state_dict(lora)
+
+        name_dict = lora_loader.get_name_dict(lora_state_dict)
+        lora_keys = set()
+        for key_b, key_a in name_dict.values():
+            lora_keys.add(key_b)
+            lora_keys.add(key_a)
+        extra_state_dict = {k: v for k, v in lora_state_dict.items() if k not in lora_keys}
+        lora_state_dict = {k: v for k, v in lora_state_dict.items() if k in lora_keys}
+
+        if extra_state_dict:
+            extra_state_dict = {
+                k: (v.to(device=self.device, dtype=self.torch_dtype) if torch.is_tensor(v) else v)
+                for k, v in extra_state_dict.items()
+            }
+            module.load_state_dict(extra_state_dict, strict=False)
+
+        lora = lora_loader.convert_state_dict(lora_state_dict)
         if hotload is None:
             hotload = hasattr(module, "vram_management_enabled") and getattr(module, "vram_management_enabled")
         if hotload:

@@ -33,10 +33,10 @@ This repo includes a custom Action Control module for **Wan2.2-TI2V-5B**. It add
 
 ### Feature Summary
 - **Action controller** with 8 actions: Forward, Back, Left, Right, Yaw Left, Yaw Right, Pitch Up, Pitch Down.
-- **Injection types**: `patch_add`, `layer_add`.
+- **Injection types**: `patch_add`, `layer_add`, `cross_attn` (duplicate cross-attn + gated action branch).
 - **Sparse injection**: configurable `inject_layers` (layer_add).
 - **Magnitude normalization**: Forward/Back/Left/Right magnitudes are scaled by 100 to match yaw/pitch scale.
-- **Text-based action embedding**: precomputed T5 pooled embeddings + magnitude MLP.
+- **Text-based action embedding**: pooled T5 table for `patch_add/layer_add`; token-level T5 table + mask for `cross_attn`.
 
 ### Implementation Overview
 - **Action module**: `diffsynth/models/wan_video_action_controller.py`

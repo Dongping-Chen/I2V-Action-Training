@@ -18,58 +18,6 @@ except ImportError:
     WANDB_AVAILABLE = False
 
 
-def _should_run_periodic_eval(args, global_step: int) -> bool:
-    if args is None:
-        return False
-    eval_steps = getattr(args, "eval_steps", None)
-    if eval_steps is None:
-        return False
-    try:
-        eval_steps = int(eval_steps)
-    except Exception:
-        return False
-    if eval_steps <= 0:
-        return False
-    if global_step <= 0:
-        return False
-    return global_step % eval_steps == 0
-
-
-def _resolve_eval_csv_path(args):
-    if args is None:
-        return None
-    csv_path = getattr(args, "eval_csv", None)
-    if not csv_path:
-        return None
-    if os.path.isabs(csv_path):
-        return csv_path
-    candidate = os.path.join(os.getcwd(), csv_path)
-    if os.path.isfile(candidate):
-        return candidate
-    return csv_path
-
-
-def _eval_action_magnitude_scale(unwrapped_model) -> torch.Tensor:
-    scale = getattr(unwrapped_model, "action_magnitude_scale", None)
-    if scale is None:
-        return torch.tensor([100, 100, 100, 100, 1, 1, 1, 1], dtype=torch.float32)
-    if torch.is_tensor(scale):
-        return scale.detach().to(dtype=torch.float32, device="cpu")
-    return torch.tensor(scale, dtype=torch.float32)
-
-
-def _expected_action_length(num_frames, time_division_factor, time_division_remainder):
-    if num_frames is None:
-        return None
-    if time_division_factor is None or time_division_remainder is None:
-        return None
-    if time_division_factor <= 0:
-        return None
-    if num_frames < time_division_remainder:
-        return None
-    return max(0, (num_frames - time_division_remainder) // time_division_factor)
-
-
 def _align_action_length(action_magnitude: torch.Tensor, target_len):
     if target_len is None:
         return action_magnitude
@@ -77,18 +25,11 @@ def _align_action_length(action_magnitude: torch.Tensor, target_len):
     target_len = int(target_len)
     if current_len == target_len:
         return action_magnitude
-    if current_len > target_len:
-        return action_magnitude[:, :target_len]
-    pad = target_len - current_len
-    pad_shape = (action_magnitude.shape[0], pad, action_magnitude.shape[2])
-    pad_tensor = torch.zeros(pad_shape, dtype=action_magnitude.dtype, device=action_magnitude.device)
-    return torch.cat([action_magnitude, pad_tensor], dim=1)
+    raise ValueError(f"Action length mismatch: expected {target_len}, got {current_len}.")
 
 
 def _parse_action_value(action_value) -> torch.Tensor | None:
     if action_value is None:
-        return None
-    if isinstance(action_value, float) and math.isnan(action_value):
         return None
     if isinstance(action_value, (list, tuple)):
         action = action_value
@@ -115,23 +56,6 @@ def _parse_action_value(action_value) -> torch.Tensor | None:
     return action_magnitude
 
 
-def _sanitize_filename(text: str, max_len: int = 80) -> str:
-    if not text:
-        return "sample"
-    out = []
-    for ch in str(text):
-        if ch.isalnum() or ch in ("-", "_"):
-            out.append(ch)
-        else:
-            out.append("_")
-    name = "".join(out).strip("_")
-    if not name:
-        name = "sample"
-    if len(name) > max_len:
-        name = name[:max_len].rstrip("_")
-    return name or "sample"
-
-
 def _run_periodic_eval(
     accelerator: Accelerator,
     model: DiffusionTrainingModule,
@@ -139,17 +63,22 @@ def _run_periodic_eval(
     global_step: int,
     shard_by_rank: bool = False,
 ):
-    if not _should_run_periodic_eval(args, global_step):
+    if args is None:
         return
 
-    eval_csv = _resolve_eval_csv_path(args)
-    if not eval_csv or not os.path.isfile(eval_csv):
+    eval_steps = getattr(args, "eval_steps", 0)
+    if eval_steps <= 0 or global_step % eval_steps != 0:
+        return
+
+    eval_csv = getattr(args, "eval_csv", "") or ""
+    if not eval_csv:
+        return
+    if not os.path.isabs(eval_csv):
+        eval_csv = os.path.join(os.getcwd(), eval_csv)
+    if not os.path.isfile(eval_csv):
         if accelerator.is_main_process:
             print(f"[eval] Warning: eval CSV not found, skipping: {eval_csv}")
         return
-
-    if shard_by_rank:
-        accelerator.wait_for_everyone()
     if not shard_by_rank and not accelerator.is_main_process:
         return
 
@@ -167,8 +96,21 @@ def _run_periodic_eval(
             print("[eval] Warning: model has no .pipe attribute, skipping eval.")
         return
 
-    pipe_modules = list(pipe.modules())
-    pipe_training_states = [m.training for m in pipe_modules]
+    scheduler = getattr(pipe, "scheduler", None)
+    scheduler_state = None
+    if scheduler is not None:
+        scheduler_state = {
+            "sigmas": getattr(scheduler, "sigmas", None),
+            "timesteps": getattr(scheduler, "timesteps", None),
+            "training": getattr(scheduler, "training", False),
+            "linear_timesteps_weights": getattr(scheduler, "linear_timesteps_weights", None),
+        }
+
+    pipe_child_training_states = {
+        name: child.training
+        for name, child in pipe.named_children()
+        if child is not None
+    }
     pipe.eval()
 
     use_action = getattr(pipe, "action_controller", None) is not None
@@ -180,15 +122,10 @@ def _run_periodic_eval(
     os.makedirs(eval_root, exist_ok=True)
 
     base_path = getattr(args, "eval_base_path", "") or ""
-    if base_path:
-        base_path = Path(base_path)
-    else:
-        base_path = Path(eval_csv).parent
+    base_path = Path(base_path) if base_path else Path(eval_csv).parent
 
     def resolve_path(raw_path):
-        if raw_path is None:
-            return None
-        raw_path = str(raw_path).strip()
+        raw_path = (raw_path or "").strip()
         if not raw_path:
             return None
         p = Path(raw_path)
@@ -211,96 +148,208 @@ def _run_periodic_eval(
     eval_fps = getattr(args, "eval_fps", 15)
     eval_negative_prompt = getattr(args, "eval_negative_prompt", "") or ""
 
-    expected_action_len = _expected_action_length(
-        eval_num_frames,
-        getattr(pipe, "time_division_factor", None),
-        getattr(pipe, "time_division_remainder", None),
-    )
-    action_scale = _eval_action_magnitude_scale(unwrapped)
+    time_division_factor = getattr(pipe, "time_division_factor", 4)
+    time_division_remainder = getattr(pipe, "time_division_remainder", 1)
+    expected_action_len = None
+    if time_division_factor and eval_num_frames >= time_division_remainder:
+        expected_action_len = max(0, (eval_num_frames - time_division_remainder) // time_division_factor)
+
+    action_scale = getattr(unwrapped, "action_magnitude_scale", None)
+    if action_scale is None:
+        action_scale = torch.tensor([100, 100, 100, 100, 1, 1, 1, 1], dtype=torch.float32)
+    elif not torch.is_tensor(action_scale):
+        action_scale = torch.tensor(action_scale, dtype=torch.float32)
+    action_scale = action_scale.detach().to(dtype=torch.float32, device="cpu")
 
     rank = accelerator.process_index
     world_size = accelerator.num_processes
     manifest = []
-    errors = 0
-
-    with open(eval_csv, "r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
 
     try:
-        for row_idx, row in enumerate(rows):
-            if shard_by_rank and (row_idx % world_size) != rank:
-                continue
+        overlay_actions_fn = None
+        action_names = None
+        if use_action:
+            import cv2
+            import numpy as np
 
-            prompt = row.get("prompt") or ""
-            video_path = resolve_path(row.get("video"))
-            input_image_path = resolve_path(row.get("input_image"))
-            action_value = row.get("action")
+            action_names = [
+                "Forward",
+                "Back",
+                "Left",
+                "Right",
+                "Yaw Left",
+                "Yaw Right",
+                "Pitch Up",
+                "Pitch Down",
+            ]
 
-            stem = _sanitize_filename(getattr(video_path, "stem", "") or f"row{row_idx}")
-            out_prefix = f"{row_idx:04d}_{stem}"
-            out_video_path = os.path.join(eval_root, f"{out_prefix}_{'action' if use_action else 'ti2v'}.mp4")
-            out_input_path = os.path.join(eval_root, f"{out_prefix}_input.jpg")
+            def draw_translation_controls(frame, base_x, base_y, size, actions):
+                gap = int(size * 1.5)
+                btn_radius = size // 2 + 6
+                arrow_half_len = size // 3
+                buttons = [
+                    ("Forward", base_x, base_y - gap, (0, -1)),
+                    ("Left", base_x - gap, base_y, (-1, 0)),
+                    ("Back", base_x, base_y, (0, 1)),
+                    ("Right", base_x + gap, base_y, (1, 0)),
+                ]
+                overlay = frame.copy()
+                for name, bx, by, _ in buttons:
+                    cv2.circle(overlay, (bx, by), btn_radius, (30, 30, 30), -1)
+                frame[:] = cv2.addWeighted(overlay, 0.7, frame, 0.3, 0)
+                for name, bx, by, direction in buttons:
+                    active = name in actions
+                    dx, dy = direction
+                    start_pt = (bx - dx * arrow_half_len, by - dy * arrow_half_len)
+                    end_pt = (bx + dx * arrow_half_len, by + dy * arrow_half_len)
+                    color = (255, 255, 255) if active else (60, 60, 60)
+                    thickness = 3 if active else 2
+                    cv2.arrowedLine(frame, start_pt, end_pt, color, thickness, tipLength=0.4)
 
-            record = {
-                "row_idx": row_idx,
-                "rank": rank,
-                "world_size": world_size,
-                "video": str(video_path) if video_path else None,
-                "input_image": str(input_image_path) if input_image_path else None,
-                "seed": int(eval_seed) + int(row_idx),
-                "output_video": out_video_path,
-            }
-            try:
-                if input_image_path and input_image_path.exists():
-                    input_image = Image.open(input_image_path).convert("RGB")
-                elif video_path and video_path.exists():
-                    input_image = VideoData(str(video_path))[0]
-                else:
-                    raise FileNotFoundError(f"Missing input_image and video for row {row_idx}")
+            def draw_rotation_indicator(frame, position, size, active, direction):
+                x, y = position
+                dx, dy = direction
+                arrow_half_len = size // 3
+                start_pt = (x - dx * arrow_half_len, y - dy * arrow_half_len)
+                end_pt = (x + dx * arrow_half_len, y + dy * arrow_half_len)
+                color = (255, 255, 255) if active else (40, 40, 40)
+                thickness = 3 if active else 2
+                cv2.arrowedLine(frame, start_pt, end_pt, color, thickness, tipLength=0.4)
 
-                input_image = image_processor(input_image)
-                input_image.save(out_input_path)
+            def overlay_actions_on_frame(frame, actions, sz_trans, sz_rot):
+                h, w = frame.shape[:2]
+                base_x = int(0.12 * w)
+                base_y = int(0.85 * h)
+                draw_translation_controls(frame, base_x, base_y, sz_trans, actions)
+                edge_margin = int(0.06 * min(w, h))
+                draw_rotation_indicator(frame, (w // 2, edge_margin + sz_rot // 2), sz_rot, "Pitch Up" in actions, (0, -1))
+                draw_rotation_indicator(frame, (w // 2, h - edge_margin - sz_rot // 2), sz_rot, "Pitch Down" in actions, (0, 1))
+                draw_rotation_indicator(frame, (edge_margin + sz_rot // 2, h // 2), sz_rot, "Yaw Left" in actions, (-1, 0))
+                draw_rotation_indicator(frame, (w - edge_margin - sz_rot // 2, h // 2), sz_rot, "Yaw Right" in actions, (1, 0))
 
-                height = int(input_image.size[1])
-                width = int(input_image.size[0])
+            def overlay_actions_on_frames(frames, frame_actions):
+                if not frames:
+                    return frames
+                sample = np.array(frames[0]) if isinstance(frames[0], Image.Image) else frames[0]
+                height, width = sample.shape[:2]
+                sz_trans = max(36, int(min(width, height) * 0.07))
+                sz_rot = max(44, int(min(width, height) * 0.08))
+                output = []
+                for idx, frame in enumerate(frames):
+                    frame_np = np.array(frame) if isinstance(frame, Image.Image) else frame.copy()
+                    actions = frame_actions[idx] if idx < len(frame_actions) else set()
+                    overlay_actions_on_frame(frame_np, actions, sz_trans, sz_rot)
+                    output.append(frame_np)
+                return output
 
-                gen_kwargs = dict(
-                    prompt=prompt,
-                    negative_prompt=eval_negative_prompt,
-                    input_image=input_image,
-                    height=height,
-                    width=width,
-                    num_frames=eval_num_frames,
-                    num_inference_steps=eval_num_inference_steps,
-                    cfg_scale=eval_cfg_scale,
-                    seed=int(eval_seed) + int(row_idx),
-                    rand_device=getattr(pipe, "device", "cpu"),
-                    tiled=True,
-                    progress_bar_cmd=(lambda x: x),
-                )
+            overlay_actions_fn = overlay_actions_on_frames
 
-                if use_action:
-                    action_magnitude = _parse_action_value(action_value)
-                    if action_magnitude is None:
-                        raise ValueError(f"Missing action for row {row_idx}")
-                    action_magnitude = _align_action_length(action_magnitude, expected_action_len)
-                    action_magnitude = action_magnitude * action_scale.to(action_magnitude.device, action_magnitude.dtype)
-                    gen_kwargs["action_magnitude"] = action_magnitude
+        with open(eval_csv, "r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            for row_idx, row in enumerate(reader):
+                if shard_by_rank and (row_idx % world_size) != rank:
+                    continue
 
-                with torch.no_grad():
-                    video = pipe(**gen_kwargs)
-                save_video(video, out_video_path, fps=eval_fps, quality=5)
+                prompt = row.get("prompt") or ""
+                video_path = resolve_path(row.get("video"))
+                input_image_path = resolve_path(row.get("input_image"))
+                action_value = row.get("action")
 
-                record["ok"] = True
-            except Exception as e:
-                errors += 1
-                record["ok"] = False
-                record["error"] = str(e)
-            manifest.append(record)
+                out_prefix = f"{row_idx:04d}"
+                out_video_path = os.path.join(eval_root, f"{out_prefix}_{'action' if use_action else 'ti2v'}.mp4")
+                out_input_path = os.path.join(eval_root, f"{out_prefix}_input.jpg")
+                out_overlay_path = os.path.join(eval_root, f"{out_prefix}_action_overlay.mp4") if use_action else None
+
+                record = {
+                    "row_idx": row_idx,
+                    "rank": rank,
+                    "world_size": world_size,
+                    "video": str(video_path) if video_path else None,
+                    "input_image": str(input_image_path) if input_image_path else None,
+                    "seed": int(eval_seed) + int(row_idx),
+                    "output_video": out_video_path,
+                }
+
+                try:
+                    if input_image_path and input_image_path.exists():
+                        input_image = Image.open(input_image_path).convert("RGB")
+                    elif video_path and video_path.exists():
+                        input_image = VideoData(str(video_path))[0]
+                    else:
+                        raise FileNotFoundError(f"Missing input_image and video for row {row_idx}")
+
+                    input_image = image_processor(input_image)
+                    input_image.save(out_input_path)
+
+                    height = int(input_image.size[1])
+                    width = int(input_image.size[0])
+
+                    gen_kwargs = dict(
+                        prompt=prompt,
+                        negative_prompt=eval_negative_prompt,
+                        input_image=input_image,
+                        height=height,
+                        width=width,
+                        num_frames=eval_num_frames,
+                        num_inference_steps=eval_num_inference_steps,
+                        cfg_scale=eval_cfg_scale,
+                        seed=int(eval_seed) + int(row_idx),
+                        rand_device=getattr(pipe, "device", "cpu"),
+                        tiled=True,
+                        progress_bar_cmd=(lambda x: x),
+                    )
+
+                    if use_action:
+                        action_magnitude = _parse_action_value(action_value)
+                        if action_magnitude is None:
+                            raise ValueError(f"Missing action for row {row_idx}")
+                        action_magnitude = _align_action_length(action_magnitude, expected_action_len)
+                        action_magnitude_raw = action_magnitude.detach().clone()
+                        action_magnitude = action_magnitude * action_scale.to(action_magnitude.device, action_magnitude.dtype)
+                        gen_kwargs["action_magnitude"] = action_magnitude
+
+                    with torch.no_grad():
+                        video = pipe(**gen_kwargs)
+                    save_video(video, out_video_path, fps=eval_fps, quality=5, progress=False)
+                    if use_action and overlay_actions_fn is not None and out_overlay_path is not None:
+                        threshold = 1e-6
+                        action_sets = []
+                        for step in action_magnitude_raw[0]:
+                            active = {action_names[i] for i, value in enumerate(step.tolist()) if value > threshold}
+                            action_sets.append(active)
+                        frame_actions = []
+                        for frame_id in range(len(video)):
+                            if frame_id < time_division_remainder or time_division_factor <= 0:
+                                frame_actions.append(set())
+                                continue
+                            step_id = (frame_id - time_division_remainder) // time_division_factor
+                            if 0 <= step_id < len(action_sets):
+                                frame_actions.append(action_sets[int(step_id)])
+                            else:
+                                frame_actions.append(set())
+                        overlay_frames = overlay_actions_fn(video, frame_actions)
+                        save_video(overlay_frames, out_overlay_path, fps=eval_fps, quality=5, progress=False)
+                    record["ok"] = True
+                except Exception as e:
+                    record["ok"] = False
+                    record["error"] = str(e)
+                manifest.append(record)
     finally:
-        for module, state in zip(pipe_modules, pipe_training_states):
-            module.training = state
+        for name, child in pipe.named_children():
+            if child is None or name not in pipe_child_training_states:
+                continue
+            if pipe_child_training_states[name]:
+                child.train()
+            else:
+                child.eval()
+        if scheduler is not None and scheduler_state is not None:
+            if scheduler_state["sigmas"] is not None:
+                scheduler.sigmas = scheduler_state["sigmas"]
+            if scheduler_state["timesteps"] is not None:
+                scheduler.timesteps = scheduler_state["timesteps"]
+            scheduler.training = scheduler_state["training"]
+            if scheduler_state["linear_timesteps_weights"] is not None:
+                scheduler.linear_timesteps_weights = scheduler_state["linear_timesteps_weights"]
 
     manifest_path = os.path.join(eval_root, f"manifest_rank{rank:02d}.json")
     with open(manifest_path, "w", encoding="utf-8") as f:
@@ -312,22 +361,9 @@ def _run_periodic_eval(
     if shard_by_rank:
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
-            total_rows = 0
-            total_ok = 0
-            total_err = 0
-            for r in range(world_size):
-                path = os.path.join(eval_root, f"manifest_rank{r:02d}.json")
-                if not os.path.isfile(path):
-                    continue
-                with open(path, "r", encoding="utf-8") as f:
-                    items = json.load(f)
-                total_rows += len(items)
-                total_ok += sum(1 for item in items if item.get("ok"))
-                total_err += sum(1 for item in items if not item.get("ok"))
-            print(f"[eval] step={global_step} done, wrote {eval_root} (ok={total_ok}/{total_rows}, errors={total_err})")
+            print(f"[eval] step={global_step} done, wrote {eval_root}")
     elif accelerator.is_main_process:
-        total_done = sum(1 for item in manifest if item.get("ok"))
-        print(f"[eval] step={global_step} done, wrote {eval_root} (ok={total_done}, errors={errors})")
+        print(f"[eval] step={global_step} done, wrote {eval_root}")
 
 
 def _safe_scalar(tensor: torch.Tensor):
@@ -527,7 +563,9 @@ def launch_training_task(
             return 1.0
         if warmup_steps > 0 and step < warmup_steps:
             warmup_scale = float(step + 1) / float(warmup_steps)
-            return min_ratio + (1.0 - min_ratio) * warmup_scale
+            # Warm up from 0 -> 1 regardless of `min_lr`.
+            # `min_lr` is treated as the cosine decay floor after warmup.
+            return warmup_scale
         progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
         progress = min(max(progress, 0.0), 1.0)
         cosine_scale = 0.5 * (1.0 + math.cos(math.pi * progress))
@@ -644,6 +682,7 @@ def launch_training_task(
             else:
                 epoch_iterator = tqdm(epoch_dataloader)
         for data in epoch_iterator:
+            stop_after_step = False
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
                 if dataset.load_from_cache:
@@ -692,8 +731,10 @@ def launch_training_task(
                 # Check max_steps
                 if max_steps is not None and global_step >= max_steps:
                     should_stop = True
-                    break
+                    stop_after_step = True
             _run_periodic_eval(accelerator, model, args, global_step, shard_by_rank=True)
+            if stop_after_step:
+                break
         if resume_step_in_epoch and epoch_id == start_epoch:
             resume_step_in_epoch = 0
 

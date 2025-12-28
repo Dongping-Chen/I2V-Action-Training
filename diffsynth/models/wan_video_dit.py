@@ -167,16 +167,81 @@ class CrossAttention(nn.Module):
             
         self.attn = AttentionModule(self.num_heads)
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor):
+    def forward(self, x: torch.Tensor, y: torch.Tensor, y_mask: Optional[torch.Tensor] = None):
         if self.has_image_input:
             img = y[:, :257]
             ctx = y[:, 257:]
+            ctx_mask = y_mask[:, 257:] if y_mask is not None else None
         else:
             ctx = y
+            ctx_mask = y_mask
         q = self.norm_q(self.q(x))
         k = self.norm_k(self.k(ctx))
         v = self.v(ctx)
-        x = self.attn(q, k, v)
+        if ctx_mask is None:
+            x = self.attn(q, k, v)
+        else:
+            ctx_mask = ctx_mask.to(device=q.device, dtype=torch.bool)
+            if ctx_mask.numel() > 0:
+                ctx_mask = ctx_mask.clone()
+                ctx_mask[..., 0] = True
+            use_flash_varlen = (
+                (not self.has_image_input)
+                and q.is_cuda
+                and q.dtype in (torch.float16, torch.bfloat16)
+                and FLASH_ATTN_2_AVAILABLE
+            )
+            flash_attn_varlen_func = None
+            if use_flash_varlen:
+                try:
+                    from flash_attn import flash_attn_varlen_func as _flash_attn_varlen_func
+                    flash_attn_varlen_func = _flash_attn_varlen_func
+                except Exception:
+                    flash_attn_varlen_func = None
+
+            if flash_attn_varlen_func is not None:
+                bsz, q_len, dim = q.shape
+                head_dim = dim // self.num_heads
+                if head_dim * self.num_heads != dim:
+                    raise ValueError(f"CrossAttention: dim {dim} not divisible by num_heads {self.num_heads}.")
+                k_lens = ctx_mask.sum(dim=1).to(dtype=torch.int32)
+                if (k_lens == 0).any():
+                    raise ValueError("CrossAttention: ctx_mask has empty sequences after sanitization.")
+                max_k = int(k_lens.max().item())
+
+                q_unpad = q.reshape(bsz * q_len, self.num_heads, head_dim)
+                k_unpad = k[ctx_mask].reshape(-1, self.num_heads, head_dim)
+                v_unpad = v[ctx_mask].reshape(-1, self.num_heads, head_dim)
+
+                cu_seqlens_q = torch.arange(
+                    0,
+                    (bsz + 1) * q_len,
+                    step=q_len,
+                    device=q.device,
+                    dtype=torch.int32,
+                )
+                cu_seqlens_k = torch.zeros(bsz + 1, device=q.device, dtype=torch.int32)
+                cu_seqlens_k[1:] = torch.cumsum(k_lens, dim=0)
+
+                out = flash_attn_varlen_func(
+                    q_unpad,
+                    k_unpad,
+                    v_unpad,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    max_seqlen_q=q_len,
+                    max_seqlen_k=max_k,
+                    dropout_p=0.0,
+                    causal=False,
+                )
+                x = out.reshape(bsz, q_len, dim)
+            else:
+                q_ = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads)
+                k_ = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads)
+                v_ = rearrange(v, "b s (n d) -> b n s d", n=self.num_heads)
+                attn_mask = (~ctx_mask)[:, None, None, :].to(dtype=q_.dtype) * torch.finfo(q_.dtype).min
+                x = F.scaled_dot_product_attention(q_, k_, v_, attn_mask=attn_mask)
+                x = rearrange(x, "b n s d -> b s (n d)")
         if self.has_image_input:
             k_img = self.norm_k_img(self.k_img(img))
             v_img = self.v_img(img)
@@ -218,6 +283,8 @@ class DiTBlock(nn.Module):
         freqs,
         action_controller=None,
         action_emb=None,
+        action_context=None,
+        action_context_mask=None,
         block_idx: Optional[int] = None,
         num_frames: Optional[int] = None,
         height: Optional[int] = None,
@@ -235,16 +302,28 @@ class DiTBlock(nn.Module):
             )
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
         x = self.gate(x, gate_msa, self.self_attn(input_x, freqs))
-        x = x + self.cross_attn(self.norm3(x), context)
+        x_norm3 = self.norm3(x)
+        x = x + self.cross_attn(x_norm3, context)
         if (
             action_controller is not None
-            and action_emb is not None
             and block_idx is not None
             and num_frames is not None
             and height is not None
             and width is not None
         ):
-            x = action_controller.apply_action(x, action_emb, num_frames, height, width, block_idx)
+            if getattr(action_controller, "injection_type", None) == "cross_attn":
+                x = action_controller.apply_action_cross_attn(
+                    x,
+                    x_norm3,
+                    action_context,
+                    action_context_mask,
+                    num_frames,
+                    height,
+                    width,
+                    block_idx,
+                )
+            elif action_emb is not None:
+                x = action_controller.apply_action(x, action_emb, num_frames, height, width, block_idx)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
         return x
